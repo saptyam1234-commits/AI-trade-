@@ -430,10 +430,8 @@ async function getMarketData(symbol, tf) {
 }
 
 // ═══════════════════════════════════════════════════════
-//  AI ENGINE
+//  AI ENGINE — Gemini Only
 // ═══════════════════════════════════════════════════════
-const CLAUDE_THRESHOLD = 75;
-
 function buildLayer1(smcData) {
   const { currentPrice,overallBias,confidence,emaData,marketStructure,bos,choch,orderBlocks,liquidity,fvg,slHunts,volumeData,keyLevels,suggestedEntry,suggestedSL,suggestedTarget } = smcData;
   const ms=marketStructure||{};
@@ -467,41 +465,45 @@ Respond ONLY in JSON (no markdown): {"verdict":"TAKE/SKIP/WAIT","signal":"BUY/SE
 
 function parseDecision(text, source, layer1) {
   try { const p=JSON.parse(text.replace(/```json|```/g,"").trim()); p.aiSource=source; p.layer1=layer1; return p; }
-  catch { return { verdict:"WAIT",signal:layer1.bias==="BULLISH"?"BUY":layer1.bias==="BEARISH"?"SELL":"NEUTRAL",confidence:layer1.engineScore,entryReason:"Engine: "+layer1.confluences.join(", "),riskWarning:"AI parse error",bestTimeToEnter:"Wait for confirmation",entry:String(layer1.suggestedEntry),stopLoss:String(layer1.suggestedSL),target1:String(layer1.suggestedTarget),target2:"—",rrRatio:"—",confluenceScore:Math.min(10,layer1.confluenceCount),setupQuality:layer1.confluenceCount>=5?"A":layer1.confluenceCount>=3?"B":"C",smcKey:layer1.confluences[0]||"None",invalidation:"Price closes beyond SL",verdictReason:"Fallback",aiSource:source,layer1 }; }
-}
-
-async function callClaude(prompt, apiKey) {
-  const res=await axios.post("https://api.anthropic.com/v1/messages",{model:"claude-sonnet-4-20250514",max_tokens:1500,messages:[{role:"user",content:prompt}]},{headers:{"Content-Type":"application/json","x-api-key":apiKey,"anthropic-version":"2023-06-01"},timeout:30000});
-  return res.data.content?.[0]?.text||"";
+  catch { return { verdict:"WAIT",signal:layer1.bias==="BULLISH"?"BUY":layer1.bias==="BEARISH"?"SELL":"NEUTRAL",confidence:layer1.engineScore,entryReason:"Engine: "+layer1.confluences.join(", "),riskWarning:"AI parse error — review manually",bestTimeToEnter:"Wait for confirmation",entry:String(layer1.suggestedEntry),stopLoss:String(layer1.suggestedSL),target1:String(layer1.suggestedTarget),target2:"—",rrRatio:"—",confluenceScore:Math.min(10,layer1.confluenceCount),setupQuality:layer1.confluenceCount>=5?"A":layer1.confluenceCount>=3?"B":"C",smcKey:layer1.confluences[0]||"None",invalidation:"Price closes beyond SL",verdictReason:"Fallback — Gemini response unparseable",aiSource:source,layer1 }; }
 }
 
 async function callGemini(prompt, apiKey) {
-  const res=await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,{contents:[{parts:[{text:prompt}]}],generationConfig:{temperature:0.2,maxOutputTokens:1500}},{timeout:30000});
-  return res.data.candidates?.[0]?.content?.parts?.[0]?.text||"";
+  const model = "gemini-2.5-flash";
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  try {
+    const res = await axios.post(url,
+      { contents:[{parts:[{text:prompt}]}], generationConfig:{temperature:0.2,maxOutputTokens:1500} },
+      { timeout:30000 }
+    );
+    return res.data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  } catch(e) {
+    const status = e.response?.status;
+    const apiErr  = e.response?.data?.error?.message || e.message;
+    console.error(`Gemini API error [${status || "no-status"}]: ${apiErr}`);
+    if (e.response?.data) console.error("Gemini full response:", JSON.stringify(e.response.data));
+    throw new Error(`Gemini failed: ${status ? `HTTP ${status} — ${apiErr}` : apiErr}`);
+  }
 }
 
-async function analyzeWithAI({ symbol, timeframe, smcData, claudeKey, geminiKey, extraContext }) {
-  const layer1=buildLayer1(smcData);
-  const prompt=buildPrompt(symbol,timeframe,layer1,extraContext);
-  let geminiDecision=null;
-  if (geminiKey) {
-    try {
-      const text=await callGemini(prompt,geminiKey);
-      geminiDecision=parseDecision(text,"Gemini",layer1);
-      const conf=geminiDecision.confidence||0, isTake=geminiDecision.verdict==="TAKE";
-      if (claudeKey&&conf>=CLAUDE_THRESHOLD&&isTake) {
-        try {
-          const vp=`Validate this ${symbol}(${timeframe}) signal from Gemini: Verdict:${geminiDecision.verdict} Signal:${geminiDecision.signal} Conf:${conf}% Entry:${geminiDecision.entry} SL:${geminiDecision.stopLoss} T1:${geminiDecision.target1} Reason:${geminiDecision.entryReason} SMC:Bias:${layer1.bias} Conf(${layer1.confluenceCount}):${layer1.confluences.join(",")} HTF:${layer1.msTrend} EMA:${layer1.ema.trend}. CONFIRM or OVERRIDE. Respond ONLY in JSON: {"verdict":"TAKE/SKIP/WAIT","signal":"BUY/SELL/NEUTRAL","confidence":0-100,"entryReason":"<2-3 sentences>","riskWarning":"<1-2 sentences>","bestTimeToEnter":"<condition>","entry":"<price>","stopLoss":"<price>","target1":"<price>","target2":"<price>","rrRatio":"1:X","confluenceScore":0-10,"setupQuality":"A+/A/B/C/INVALID","smcKey":"<reason>","invalidation":"<condition>","verdictReason":"<1 sentence>"}`;
-          const ct=await callClaude(vp,claudeKey);
-          const cd=parseDecision(ct,"Claude+Gemini",layer1);
-          return {...cd,geminiVerdict:geminiDecision.verdict,geminiConfidence:conf,claudeValidated:true,aiSource:"Claude ✅ (Gemini pre-screened)",layer1};
-        } catch(e) { console.warn("Claude validation failed:",e.message); }
-      }
-      geminiDecision.claudeValidated=false; return geminiDecision;
-    } catch(e) { console.warn("Gemini failed:",e.message); }
+async function analyzeWithAI({ symbol, timeframe, smcData, geminiKey, extraContext }) {
+  const layer1 = buildLayer1(smcData);
+
+  if (!geminiKey) {
+    const err = new Error("Gemini API key required");
+    err.isUserError = true;
+    throw err;
   }
-  if (claudeKey) { const text=await callClaude(prompt,claudeKey); const d=parseDecision(text,"Claude",layer1); d.claudeValidated=true; return d; }
-  throw new Error("No AI API key provided");
+
+  const prompt = buildPrompt(symbol, timeframe, layer1, extraContext);
+
+  try {
+    const text = await callGemini(prompt, geminiKey);
+    return parseDecision(text, "Gemini", layer1);
+  } catch(e) {
+    console.error(`analyzeWithAI failed for ${symbol} (${timeframe}): ${e.message}`);
+    throw e;
+  }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -535,41 +537,57 @@ function formatSignal(symbol, tf, decision, smcData, riskData) {
 // ═══════════════════════════════════════════════════════
 //  ROUTES
 // ═══════════════════════════════════════════════════════
-app.get("/", (req,res) => res.json({ status:"TradeSignal AI — SMC Server v3.2 ✅", dataSources:{crypto:"CoinGecko (FREE, no restrictions)",forex:"Twelve Data (FREE)",indian:"Yahoo Finance (FREE)"}, features:["SMC","BOS/CHoCH","HH/HL/LL/LH","OB","Liquidity","FVG","SL Hunt","EMA 5/10/20/30","Gemini+Claude","Telegram"] }));
+app.get("/", (req,res) => res.json({ status:"TradeSignal AI — SMC Server v3.2 ✅", dataSources:{crypto:"CoinGecko (FREE, no restrictions)",forex:"Twelve Data (FREE)",indian:"Yahoo Finance (FREE)"}, features:["SMC","BOS/CHoCH","HH/HL/LL/LH","OB","Liquidity","FVG","SL Hunt","EMA 5/10/20/30","Gemini","Telegram"] }));
 
 app.post("/analyze", async (req,res) => {
-  const { symbol,timeframe="1h",claudeKey,geminiKey,telegramToken,telegramChannel,accountSize=10000,extraContext="",sendToTelegram=false } = req.body;
+  const { symbol,timeframe="1h",geminiKey,telegramToken,telegramChannel,accountSize=10000,extraContext="",sendToTelegram=false } = req.body;
   if (!symbol) return res.status(400).json({error:"Symbol required"});
-  if (!claudeKey&&!geminiKey) return res.status(400).json({error:"AI API key required"});
+
+  const effectiveGeminiKey = geminiKey || process.env.GEMINI_API_KEY;
+  if (!effectiveGeminiKey) return res.status(400).json({error:"Gemini API key required"});
+
   try {
     const marketData=await getMarketData(symbol,timeframe);
     const smcData=SMCEngine.fullAnalysis(marketData);
-    const aiSignal=await analyzeWithAI({symbol,timeframe,smcData,claudeKey,geminiKey,extraContext});
+    const aiSignal=await analyzeWithAI({symbol,timeframe,smcData,geminiKey:effectiveGeminiKey,extraContext});
     const riskData=SMCEngine.calcRiskManagement(parseFloat(aiSignal.entry)||smcData.suggestedEntry,parseFloat(aiSignal.stopLoss)||smcData.suggestedSL,parseFloat(aiSignal.target1)||smcData.suggestedTarget,accountSize,1);
     let telegramSent=false;
     if (sendToTelegram&&telegramToken&&telegramChannel&&aiSignal.confidence>=65) {
-      try { await sendTelegram(telegramToken,telegramChannel,formatSignal(symbol,timeframe,aiSignal,smcData,riskData)); telegramSent=true; } catch(e) { console.error("TG error:",e.message); }
+      try { await sendTelegram(telegramToken,telegramChannel,formatSignal(symbol,timeframe,aiSignal,smcData,riskData)); telegramSent=true; } catch(e) { console.error(`Telegram send failed [${symbol}]:`,e.message); }
     }
     res.json({ success:true,symbol:symbol.toUpperCase(),timeframe,timestamp:new Date().toISOString(),currentPrice:smcData.currentPrice,livePrice:marketData.livePrice,dataSource:marketData.source,market:{market:classifyMarket(symbol)},smc:{bias:smcData.overallBias,confidence:smcData.confidence,ema:smcData.emaData,marketStructure:smcData.marketStructure,bos:smcData.bos,choch:smcData.choch,orderBlocks:smcData.orderBlocks,liquidity:smcData.liquidity,fvg:smcData.fvg,slHunts:smcData.slHunts,volume:smcData.volumeData,keyLevels:smcData.keyLevels},signal:aiSignal,risk:riskData,telegramSent,aiSource:aiSignal.aiSource });
-  } catch(e) { console.error("Analyze error:",e.message); res.status(500).json({error:e.message}); }
+  } catch(e) {
+    console.error(`/analyze endpoint failed [${symbol}, ${timeframe}]:`, e.message);
+    res.status(500).json({error:e.message});
+  }
 });
 
 app.post("/scan", async (req,res) => {
-  const { symbols,timeframe="1h",claudeKey,geminiKey,telegramToken,telegramChannel,minConfidence=65,accountSize=10000,sendToTelegram=false } = req.body;
+  const { symbols,timeframe="1h",geminiKey,telegramToken,telegramChannel,minConfidence=65,accountSize=10000,sendToTelegram=false } = req.body;
   if (!symbols||!Array.isArray(symbols)) return res.status(400).json({error:"symbols array required"});
   if (symbols.length>20) return res.status(400).json({error:"Max 20 symbols"});
+
+  const effectiveGeminiKey = geminiKey || process.env.GEMINI_API_KEY;
+  if (!effectiveGeminiKey) return res.status(400).json({error:"Gemini API key required"});
+
   const results=[], highConf=[];
   for (const symbol of symbols) {
     try {
-      const md=await getMarketData(symbol,timeframe), smc=SMCEngine.fullAnalysis(md), ai=await analyzeWithAI({symbol,timeframe,smcData:smc,claudeKey,geminiKey});
+      const md=await getMarketData(symbol,timeframe), smc=SMCEngine.fullAnalysis(md), ai=await analyzeWithAI({symbol,timeframe,smcData:smc,geminiKey:effectiveGeminiKey});
       const rsk=SMCEngine.calcRiskManagement(parseFloat(ai.entry)||smc.suggestedEntry,parseFloat(ai.stopLoss)||smc.suggestedSL,parseFloat(ai.target1)||smc.suggestedTarget,accountSize,1);
       results.push({symbol:symbol.toUpperCase(),timeframe,market:classifyMarket(symbol),dataSource:md.source,currentPrice:smc.currentPrice,signal:ai.signal,verdict:ai.verdict,confidence:ai.confidence,entry:ai.entry,stopLoss:ai.stopLoss,target1:ai.target1,target2:ai.target2,rrRatio:ai.rrRatio,setupQuality:ai.setupQuality,msTrend:smc.marketStructure?.trend,emaTrend:smc.emaData?.trend,aiSource:ai.aiSource,riskValid:rsk?.isValidSetup,bestTimeToEnter:ai.bestTimeToEnter});
       if (ai.confidence>=minConfidence&&["BUY","SELL"].includes(ai.signal)) highConf.push({symbol,timeframe,signal:ai,smcData:smc,riskData:rsk});
       await new Promise(r=>setTimeout(r,800));
-    } catch(e) { results.push({symbol:symbol.toUpperCase(),error:e.message}); }
+    } catch(e) {
+      console.error(`/scan failed for [${symbol}]:`, e.message);
+      results.push({symbol:symbol.toUpperCase(),error:e.message});
+    }
   }
   if (sendToTelegram&&telegramToken&&telegramChannel&&highConf.length>0) {
-    for (const s of highConf.slice(0,5)) { try { await sendTelegram(telegramToken,telegramChannel,formatSignal(s.symbol,s.timeframe,s.signal,s.smcData,s.riskData)); await new Promise(r=>setTimeout(r,1000)); } catch(e){} }
+    for (const s of highConf.slice(0,5)) {
+      try { await sendTelegram(telegramToken,telegramChannel,formatSignal(s.symbol,s.timeframe,s.signal,s.smcData,s.riskData)); await new Promise(r=>setTimeout(r,1000)); }
+      catch(e) { console.error(`Telegram send failed [${s.symbol}]:`, e.message); }
+    }
   }
   res.json({success:true,scanned:results.length,highConfidenceSignals:highConf.length,results:results.sort((a,b)=>(b.confidence||0)-(a.confidence||0))});
 });
@@ -577,32 +595,32 @@ app.post("/scan", async (req,res) => {
 app.post("/telegram/test", async (req,res) => {
   const { telegramToken,telegramChannel } = req.body;
   if (!telegramToken||!telegramChannel) return res.status(400).json({error:"Token and channel required"});
-  try { const bot=new TelegramBot(telegramToken,{polling:false}); await bot.sendMessage(telegramChannel,"✅ *TradeSignal AI SMC v3.1 Connected!* 🚀",{parse_mode:"Markdown"}); res.json({success:true}); }
-  catch(e) { res.status(500).json({error:e.message}); }
+  try { const bot=new TelegramBot(telegramToken,{polling:false}); await bot.sendMessage(telegramChannel,"✅ *TradeSignal AI SMC v3.2 Connected!* 🚀",{parse_mode:"Markdown"}); res.json({success:true}); }
+  catch(e) { console.error("Telegram test failed:", e.message); res.status(500).json({error:e.message}); }
 });
 
 // Auto scan every 4H Mon-Fri
 cron.schedule("0 9,13,17,21 * * 1-5", async () => {
-  const cKey=process.env.CLAUDE_API_KEY, gKey=process.env.GEMINI_API_KEY;
+  const gKey=process.env.GEMINI_API_KEY;
   const tToken=process.env.TELEGRAM_TOKEN, tCh=process.env.TELEGRAM_CHANNEL;
-  if ((!cKey&&!gKey)||!tToken||!tCh) return;
+  if (!gKey||!tToken||!tCh) return;
   console.log("🔄 Auto scan...");
   const watchlist=["RELIANCE","NIFTY","BANKNIFTY","TCS","HDFCBANK","BTC","ETH","SOL","XAUUSD","EURUSD"];
   const results=[];
   for (const symbol of watchlist) {
     try {
-      const md=await getMarketData(symbol,"4h"), smc=SMCEngine.fullAnalysis(md), ai=await analyzeWithAI({symbol,timeframe:"4h",smcData:smc,claudeKey:cKey,geminiKey:gKey});
+      const md=await getMarketData(symbol,"4h"), smc=SMCEngine.fullAnalysis(md), ai=await analyzeWithAI({symbol,timeframe:"4h",smcData:smc,geminiKey:gKey});
       results.push({symbol,signal:ai.signal,verdict:ai.verdict,confidence:ai.confidence,entry:ai.entry,stopLoss:ai.stopLoss,target1:ai.target1});
       if (ai.confidence>=70&&["BUY","SELL"].includes(ai.signal)) {
         const rsk=SMCEngine.calcRiskManagement(parseFloat(ai.entry)||smc.suggestedEntry,parseFloat(ai.stopLoss)||smc.suggestedSL,parseFloat(ai.target1)||smc.suggestedTarget,10000,1);
         await sendTelegram(tToken,tCh,formatSignal(symbol,"4h",ai,smc,rsk));
       }
       await new Promise(r=>setTimeout(r,1200));
-    } catch(e) { console.error(`Auto scan [${symbol}]:`,e.message); }
+    } catch(e) { console.error(`Auto scan failed [${symbol}]:`,e.message); }
   }
   console.log(`✅ Auto scan done. ${results.length} scanned.`);
 });
 
 app.listen(PORT, () => {
-  console.log(`\n🚀 TradeSignal AI — SMC Server v3.1\n━━━━━━━━━━━━━━━━━━━━\n✅ Port: ${PORT}\n📡 Crypto: Binance WebSocket (FREE)\n📊 Forex: Twelve Data (FREE)\n🏦 Indian: Yahoo Finance (FREE)\n🤖 AI: Gemini PRIMARY + Claude VALIDATOR\n📱 Telegram: Ready\n━━━━━━━━━━━━━━━━━━━━\n`);
+  console.log(`\n🚀 TradeSignal AI — SMC Server v3.2\n━━━━━━━━━━━━━━━━━━━━\n✅ Port: ${PORT}\n📡 Crypto: CoinGecko (FREE)\n📊 Forex: Twelve Data (FREE)\n🏦 Indian: Yahoo Finance (FREE)\n🤖 AI: Gemini Only\n📱 Telegram: Ready\n━━━━━━━━━━━━━━━━━━━━\n`);
 });
