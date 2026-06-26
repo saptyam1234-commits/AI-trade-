@@ -69,14 +69,75 @@ function httpGetJson(hostname, path, timeout = 15000) {
 
 function extractJSON(text) {
   if (!text) return null;
+
+  // Method 1: direct parse
   try { return JSON.parse(text.trim()); } catch {}
-  try { return JSON.parse(text.replace(/```json|```/gi, "").trim()); } catch {}
-  try { const s = text.indexOf("{"), e = text.lastIndexOf("}"); if (s !== -1 && e !== -1) return JSON.parse(text.slice(s, e + 1)); } catch {}
+
+  // Method 2: strip markdown fences
+  try { return JSON.parse(text.replace(/```json\s*|```\s*/gi, "").trim()); } catch {}
+
+  // Method 3: extract first { … } block
   try {
-    const c = text.replace(/```json|```/gi, "").replace(/,\s*}/g, "}").replace(/,\s*]/g, "]").trim();
+    const s = text.indexOf("{"), e = text.lastIndexOf("}");
+    if (s !== -1 && e !== -1) return JSON.parse(text.slice(s, e + 1));
+  } catch {}
+
+  // Method 4: fix trailing commas + extract
+  try {
+    const c = text
+      .replace(/```json\s*|```\s*/gi, "")
+      .replace(/,\s*([}\]])/g, "$1")   // trailing commas
+      .trim();
     const s = c.indexOf("{"), e = c.lastIndexOf("}");
     if (s !== -1 && e !== -1) return JSON.parse(c.slice(s, e + 1));
   } catch {}
+
+  // Method 5: aggressive repair — fix unquoted values, newlines in strings, etc.
+  try {
+    const s = text.indexOf("{"), e = text.lastIndexOf("}");
+    if (s === -1 || e === -1) return null;
+    let chunk = text.slice(s, e + 1);
+    chunk = chunk
+      .replace(/[\r\n]+/g, " ")          // no real newlines inside strings
+      .replace(/,\s*([}\]])/g, "$1")     // trailing commas
+      .replace(/([{,]\s*)(\w+)\s*:/g, '$1"$2":')  // unquoted keys
+      .replace(/:\s*'([^']*)'/g, ': "$1"');        // single-quoted values
+    return JSON.parse(chunk);
+  } catch {}
+
+  // Method 6: field-by-field regex extraction (last resort)
+  try {
+    const get = (key) => {
+      const m = text.match(new RegExp(`"${key}"\\s*:\\s*"([^"]*)"`, "i"))
+             || text.match(new RegExp(`"${key}"\\s*:\\s*([\\d.]+)`, "i"));
+      return m ? m[1] : null;
+    };
+    const verdict = get("verdict");
+    const signal  = get("signal");
+    if (verdict && signal) {
+      return {
+        verdict, signal,
+        confidence:      parseFloat(get("confidence")) || 60,
+        agreeWithEngine: true,
+        entry:           get("entry")      || null,
+        stopLoss:        get("stopLoss")   || null,
+        target1:         get("target1")    || null,
+        target2:         get("target2")    || null,
+        target3:         get("target3")    || null,
+        rrRatio:         get("rrRatio")    || null,
+        entryReason:     get("entryReason") || "AI partial parse",
+        slReason:        get("slReason")   || "",
+        riskWarning:     get("riskWarning") || "",
+        bestTimeToEnter: get("bestTimeToEnter") || "",
+        setupQuality:    get("setupQuality") || "B",
+        smcKey:          get("smcKey")     || "",
+        invalidation:    get("invalidation") || "",
+        verdictReason:   get("verdictReason") || "partial parse",
+        _partialParse:   true,
+      };
+    }
+  } catch {}
+
   return null;
 }
 
@@ -158,10 +219,15 @@ class ATREngine {
     }
   }
 
-  // [NEW] Multi-target system using key levels + RR
-  // T1 = first resistance/support (quick partial profit)
-  // T2 = second resistance/support (main target, min 3R)
-  // T3 = extended target (4-5R, trail with SL)
+  // Multi-target system — guaranteed minimum RRs
+  // T1 = 1.5R minimum (partial profit, move SL to BE)
+  // T2 = 3.0R minimum  (main target, NOT just next resistance)
+  // T3 = 5.0R minimum  (extended trail)
+  // Rules:
+  //   - Key levels used ONLY if they satisfy the minimum RR
+  //   - Levels that give < minimum are SKIPPED (not used)
+  //   - Pure ATR fallback if no valid level found
+  //   - T1, T2, T3 must be strictly increasing (BULL) or decreasing (BEAR)
   static findTargets(keyLevels, entry, sl, bias) {
     const riskPerUnit = Math.abs(entry - sl);
     if (riskPerUnit === 0) return { t1: null, t2: null, t3: null };
@@ -171,32 +237,37 @@ class ATREngine {
         .filter(r => r > entry)
         .sort((a, b) => a - b);
 
-      // T1: first resistance above entry, min 1.5R
-      const t1 = levels.find(r => (r - entry) / riskPerUnit >= 1.5)
-        || parseFloat((entry + riskPerUnit * 1.5).toFixed(6));
+      // T1: first resistance ≥ 1.5R — but skip if < 1.5R
+      const t1candidate = levels.find(r => (r - entry) / riskPerUnit >= 1.5);
+      const t1 = t1candidate ?? parseFloat((entry + riskPerUnit * 1.5).toFixed(8));
 
-      // T2: min 3R
-      const t2 = levels.find(r => (r - entry) / riskPerUnit >= 3.0)
-        || parseFloat((entry + riskPerUnit * 3.0).toFixed(6));
+      // T2: must be ≥ 3.0R AND strictly above T1
+      const t1Val = t1;
+      const t2candidate = levels.find(r => r > t1Val && (r - entry) / riskPerUnit >= 3.0);
+      const t2 = t2candidate ?? parseFloat((entry + riskPerUnit * 3.0).toFixed(8));
 
-      // T3: min 5R (extended)
-      const t3 = levels.find(r => (r - entry) / riskPerUnit >= 5.0)
-        || parseFloat((entry + riskPerUnit * 5.0).toFixed(6));
+      // T3: must be ≥ 5.0R AND strictly above T2
+      const t2Val = t2;
+      const t3candidate = levels.find(r => r > t2Val && (r - entry) / riskPerUnit >= 5.0);
+      const t3 = t3candidate ?? parseFloat((entry + riskPerUnit * 5.0).toFixed(8));
 
       return { t1, t2, t3 };
+
     } else {
       const levels = keyLevels.supportLevels
         .filter(s => s < entry)
         .sort((a, b) => b - a);
 
-      const t1 = levels.find(s => (entry - s) / riskPerUnit >= 1.5)
-        || parseFloat((entry - riskPerUnit * 1.5).toFixed(6));
+      const t1candidate = levels.find(s => (entry - s) / riskPerUnit >= 1.5);
+      const t1 = t1candidate ?? parseFloat((entry - riskPerUnit * 1.5).toFixed(8));
 
-      const t2 = levels.find(s => (entry - s) / riskPerUnit >= 3.0)
-        || parseFloat((entry - riskPerUnit * 3.0).toFixed(6));
+      const t1Val = t1;
+      const t2candidate = levels.find(s => s < t1Val && (entry - s) / riskPerUnit >= 3.0);
+      const t2 = t2candidate ?? parseFloat((entry - riskPerUnit * 3.0).toFixed(8));
 
-      const t3 = levels.find(s => (entry - s) / riskPerUnit >= 5.0)
-        || parseFloat((entry - riskPerUnit * 5.0).toFixed(6));
+      const t2Val = t2;
+      const t3candidate = levels.find(s => s < t2Val && (entry - s) / riskPerUnit >= 5.0);
+      const t3 = t3candidate ?? parseFloat((entry - riskPerUnit * 5.0).toFixed(8));
 
       return { t1, t2, t3 };
     }
@@ -1095,72 +1166,160 @@ OUTPUT only raw JSON (no markdown, no backticks):
 }`;
 }
 
-// Gemini with retry + JSON mode
-async function callGemini(prompt, apiKey) {
+// Gemini call — tries responseMimeType first, falls back to plain text if model rejects it
+async function callGeminiOnce(prompt, apiKey, useJsonMode) {
   const model = "gemini-2.5-flash";
   const url   = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  const genCfg = useJsonMode
+    ? { temperature: 0.1, maxOutputTokens: 1200, responseMimeType: "application/json" }
+    : { temperature: 0.1, maxOutputTokens: 1200 };
 
+  const res = await axios.post(url, {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: genCfg,
+    safetySettings: [
+      { category: "HARM_CATEGORY_HARASSMENT",        threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_HATE_SPEECH",       threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+    ]
+  }, { timeout: 35000 });
+
+  // Check finish reason
+  const candidate = res.data.candidates?.[0];
+  const finishReason = candidate?.finishReason;
+  if (finishReason && finishReason !== "STOP" && finishReason !== "MAX_TOKENS") {
+    throw new Error(`Gemini blocked: ${finishReason}`);
+  }
+
+  return candidate?.content?.parts?.[0]?.text || "";
+}
+
+async function callGemini(prompt, apiKey) {
+  // Strategy: attempt 1-2 with JSON mode, attempt 3 without (plain text)
   for (let attempt = 1; attempt <= 3; attempt++) {
+    const useJsonMode = attempt <= 2; // attempt 3 = plain text fallback
     try {
-      const res = await axios.post(url, {
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.15, maxOutputTokens: 1200, responseMimeType: "application/json" }
-      }, { timeout: 35000 });
-
-      const text = res.data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-      if (text.trim()) return text;
-      console.warn(`Gemini attempt ${attempt}: empty response`);
+      const text = await callGeminiOnce(prompt, apiKey, useJsonMode);
+      if (!text.trim()) {
+        console.warn(`Gemini attempt ${attempt} (jsonMode=${useJsonMode}): empty response`);
+        await new Promise(r => setTimeout(r, attempt * 800));
+        continue;
+      }
+      // Validate we can extract JSON before returning
+      const parsed = extractJSON(text);
+      if (parsed && parsed.verdict) {
+        console.log(`Gemini attempt ${attempt} (jsonMode=${useJsonMode}): OK`);
+        return text;
+      }
+      // Got text but not valid JSON — log raw for debug, try next attempt
+      console.warn(`Gemini attempt ${attempt} (jsonMode=${useJsonMode}): text received but JSON invalid. Raw: ${text.substring(0, 300)}`);
+      if (attempt < 3) {
+        await new Promise(r => setTimeout(r, attempt * 800));
+        continue;
+      }
+      // All attempts gave invalid JSON — return last text anyway, analyzeWithAI will handle
+      return text;
     } catch (e) {
       const status = e.response?.status;
       const apiErr = e.response?.data?.error?.message || e.message;
-      console.error(`Gemini attempt ${attempt} [${status || "no-status"}]: ${apiErr}`);
-      if (status === 429) { await new Promise(r => setTimeout(r, attempt * 3000)); continue; }
-      if (status >= 500)  { await new Promise(r => setTimeout(r, attempt * 1000)); continue; }
-      if (attempt === 3)  throw new Error(`Gemini failed: HTTP ${status} — ${apiErr}`);
+      console.error(`Gemini attempt ${attempt} [${status || "no-status"}] (jsonMode=${useJsonMode}): ${apiErr}`);
+
+      if (status === 429) { await new Promise(r => setTimeout(r, attempt * 4000)); continue; }
+      if (status === 400 && useJsonMode) {
+        // JSON mode not supported by this model/region — retry without it immediately
+        console.warn("JSON mode rejected (400) — retrying without responseMimeType");
+        try {
+          const text2 = await callGeminiOnce(prompt, apiKey, false);
+          if (text2.trim()) return text2;
+        } catch (e2) { console.error(`Gemini fallback attempt: ${e2.message}`); }
+      }
+      if (status >= 500) { await new Promise(r => setTimeout(r, attempt * 1000)); continue; }
+      if (attempt === 3) throw new Error(`Gemini failed after 3 attempts: ${apiErr}`);
     }
     await new Promise(r => setTimeout(r, attempt * 500));
   }
-  throw new Error("Gemini: all 3 attempts failed");
+  throw new Error("Gemini: all attempts failed");
 }
 
-// [FIX M5] Parse: explicit isAiFallback flag, never silent
+// Required fields that MUST be present in a valid AI response
+const AI_REQUIRED_FIELDS = ["verdict", "signal", "entry", "stopLoss", "target1", "target2"];
+
+function validateAIResponse(parsed) {
+  if (!parsed) return { valid: false, reason: "null response" };
+  for (const field of AI_REQUIRED_FIELDS) {
+    if (!parsed[field]) return { valid: false, reason: `missing field: ${field}` };
+  }
+  const validVerdicts = ["TAKE", "SKIP", "WAIT"];
+  const validSignals  = ["BUY", "SELL", "NEUTRAL"];
+  if (!validVerdicts.includes(parsed.verdict?.toUpperCase()))
+    return { valid: false, reason: `invalid verdict: ${parsed.verdict}` };
+  if (!validSignals.includes(parsed.signal?.toUpperCase()))
+    return { valid: false, reason: `invalid signal: ${parsed.signal}` };
+  return { valid: true };
+}
+
 async function analyzeWithAI(symbol, timeframe, smcData) {
-  // [FIX C2] NEVER accept key from request — only env
   const geminiKey = process.env.GEMINI_API_KEY;
   if (!geminiKey) throw new Error("GEMINI_API_KEY not set in server environment");
 
   const prompt = buildGeminiPrompt(symbol, timeframe, smcData);
-  const text   = await callGemini(prompt, geminiKey);
-  const parsed = extractJSON(text);
+  let parsed = null;
+  let parseFailReason = null;
 
-  if (!parsed || !parsed.verdict) {
-    // [FIX M5] Explicit flag — not silently passed as valid
-    console.warn(`Gemini JSON parse failed for ${symbol}. Raw: ${text.substring(0, 200)}`);
-    return {
-      isAiFallback: true,  // [FIX M5] Client now knows this is fallback
-      verdict: "WAIT",
-      signal: smcData.overallBias === "BULLISH" ? "BUY" : smcData.overallBias === "BEARISH" ? "SELL" : "NEUTRAL",
-      confidence: smcData.confidence,
-      agreeWithEngine: true,
-      entry: String(smcData.currentPrice),
-      stopLoss: String(smcData.risk?.sl || smcData.keyLevels.immediateSupport),
-      target1: String(smcData.risk?.t1 || ""),
-      target2: String(smcData.risk?.t2 || ""),
-      target3: String(smcData.risk?.t3 || ""),
-      rrRatio: `1:${smcData.risk?.rr2 || 0}`,
-      entryReason: `Engine fallback — ${smcData.signals?.slice(0, 5).join(", ")}`,
-      slReason: "Engine ATR-structure SL",
-      riskWarning: "AI PARSE FAILED — verify manually before trading",
-      bestTimeToEnter: "Wait for next candle confirmation",
-      setupQuality: smcData.confidence >= 70 ? "B" : "C",
-      smcKey: smcData.signals?.[0] || "None",
-      invalidation: `Price closes beyond SL at ${smcData.risk?.sl?.toFixed(4)}`,
-      verdictReason: "Gemini response unparseable — engine bias used as fallback"
-    };
+  try {
+    const text = await callGemini(prompt, geminiKey);
+    parsed = extractJSON(text);
+    const validation = validateAIResponse(parsed);
+    if (!validation.valid) {
+      parseFailReason = validation.reason;
+      console.warn(`Gemini validation failed for ${symbol}: ${parseFailReason}`);
+      parsed = null;
+    }
+  } catch (e) {
+    parseFailReason = e.message;
+    console.error(`Gemini call failed for ${symbol}: ${e.message}`);
   }
 
-  parsed.isAiFallback = false;
-  return parsed;
+  // Normalize to uppercase
+  if (parsed) {
+    parsed.verdict = parsed.verdict?.toUpperCase();
+    parsed.signal  = parsed.signal?.toUpperCase();
+    parsed.isAiFallback = parsed._partialParse === true; // partial regex parse = soft fallback
+    delete parsed._partialParse;
+    return parsed;
+  }
+
+  // Full fallback — engine takes over
+  const engineSL = smcData.risk?.sl;
+  const engineT1 = smcData.risk?.t1;
+  const engineT2 = smcData.risk?.t2;
+  const engineT3 = smcData.risk?.t3;
+  const rr2      = smcData.risk?.rr2 || 0;
+
+  return {
+    isAiFallback:    true,
+    fallbackReason:  parseFailReason || "unknown",
+    verdict:         rr2 >= 2.0 ? "WAIT" : "SKIP",   // WAIT not TAKE — user must confirm
+    signal:          smcData.overallBias === "BULLISH" ? "BUY"
+                   : smcData.overallBias === "BEARISH" ? "SELL" : "NEUTRAL",
+    confidence:      Math.min(smcData.confidence, 60), // cap at 60 on fallback
+    agreeWithEngine: true,
+    entry:           String(smcData.currentPrice),
+    stopLoss:        String(engineSL ?? smcData.keyLevels.immediateSupport),
+    target1:         String(engineT1 ?? ""),
+    target2:         String(engineT2 ?? ""),
+    target3:         String(engineT3 ?? ""),
+    rrRatio:         `1:${rr2}`,
+    entryReason:     `Engine only — ${(smcData.signals || []).slice(0, 4).join(", ")}`,
+    slReason:        "ATR + structure (engine calculated)",
+    riskWarning:     `AI PARSE FAILED (${parseFailReason}) — DO NOT TRADE without manual review`,
+    bestTimeToEnter: "Wait for Gemini to respond successfully on next scan",
+    setupQuality:    rr2 >= 3.0 ? "B" : "C",
+    smcKey:          smcData.signals?.[0] || "None",
+    invalidation:    engineSL ? `Close beyond ${engineSL.toFixed(4)}` : "See SL level",
+    verdictReason:   `Gemini parse failed — engine fallback. Reason: ${parseFailReason}`,
+  };
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1171,71 +1330,115 @@ function resolveRisk(aiSignal, smcData, accountSize = 10000) {
   const engineRisk = smcData.risk;
   const bias       = smcData.overallBias;
   const price      = smcData.currentPrice;
-  const atr        = smcData.atr;
+  const atr        = smcData.atr || 0;
+  const isBull     = bias === "BULLISH";
 
-  // Entry: prefer AI if valid, else engine
-  let entry = parseFloat(aiSignal.entry) || price;
-  if (isNaN(entry) || entry <= 0) entry = price;
+  // ── Entry ──────────────────────────────────────────
+  let entry = parseFloat(aiSignal.entry);
+  if (!entry || isNaN(entry) || entry <= 0) entry = price;
 
-  // SL: prefer AI if structurally valid, else engine ATR SL
-  let sl = parseFloat(aiSignal.stopLoss) || null;
-  const isBull = bias === "BULLISH";
-  const slValid = sl && !isNaN(sl) &&
-    ((isBull && sl < entry) || (!isBull && sl > entry)) &&
-    (Math.abs(entry - sl) <= atr * 5); // Not more than 5 ATR away (not too wide)
+  // ── SL: prefer AI if structurally valid, else engine ATR SL ──
+  let sl       = parseFloat(aiSignal.stopLoss);
+  const slGap  = Math.abs(entry - sl);
+  const maxSL  = atr * 5; // SL max 5 ATR away (not too wide)
+  const minSL  = atr * 0.3; // SL min 0.3 ATR away (not too tight)
 
+  const slValid = sl && !isNaN(sl)
+    && ((isBull && sl < entry) || (!isBull && sl > entry))
+    && slGap <= maxSL
+    && slGap >= minSL;
+
+  let slSource = "AI_VALIDATED";
   if (!slValid) {
-    sl = engineRisk?.sl || (isBull ? entry - atr * 1.5 : entry + atr * 1.5);
-    console.log(`SL from AI invalid (${aiSignal.stopLoss}) — using engine ATR SL: ${sl}`);
+    sl       = engineRisk?.sl ?? (isBull ? entry - atr * 1.5 : entry + atr * 1.5);
+    slSource = "ENGINE_ATR";
+    console.log(`[resolveRisk] SL from AI invalid (${aiSignal.stopLoss}) → engine: ${sl?.toFixed(4)}`);
   }
 
   const riskPerUnit = Math.abs(entry - sl);
   if (riskPerUnit === 0) return { error: "SL equals entry", ...engineRisk };
 
-  // Targets: prefer AI if valid RR, else engine
+  // ── Targets: prefer AI, but ENFORCE minimum RR ──────
+  // T1 must be ≥ 1.5R
+  // T2 must be ≥ 2.0R (minimum valid trade) — raised from nothing
+  // T3 must be ≥ 4.0R
   let t1 = parseFloat(aiSignal.target1);
   let t2 = parseFloat(aiSignal.target2);
   let t3 = parseFloat(aiSignal.target3);
 
-  const t1Valid = t1 && !isNaN(t1) && ((isBull && t1 > entry) || (!isBull && t1 < entry));
-  const t2Valid = t2 && !isNaN(t2) && ((isBull && t2 > entry) || (!isBull && t2 < entry));
-  const t3Valid = t3 && !isNaN(t3) && ((isBull && t3 > entry) || (!isBull && t3 < entry));
+  const dirOk = (t) => isBull ? t > entry : t < entry;
+  const rrOf  = (t) => Math.abs(t - entry) / riskPerUnit;
 
-  if (!t1Valid) t1 = engineRisk?.t1 || (isBull ? entry + riskPerUnit * 1.5 : entry - riskPerUnit * 1.5);
-  if (!t2Valid) t2 = engineRisk?.t2 || (isBull ? entry + riskPerUnit * 3.0 : entry - riskPerUnit * 3.0);
-  if (!t3Valid) t3 = engineRisk?.t3 || (isBull ? entry + riskPerUnit * 5.0 : entry - riskPerUnit * 5.0);
+  // T1: AI ok if ≥ 1.5R in right direction
+  if (!t1 || isNaN(t1) || !dirOk(t1) || rrOf(t1) < 1.5) {
+    t1 = engineRisk?.t1 ?? (isBull ? entry + riskPerUnit * 1.5 : entry - riskPerUnit * 1.5);
+    console.log(`[resolveRisk] T1 adjusted → ${t1?.toFixed(4)} (AI was ${aiSignal.target1})`);
+  }
 
-  const rr1 = parseFloat((Math.abs(t1 - entry) / riskPerUnit).toFixed(2));
-  const rr2 = parseFloat((Math.abs(t2 - entry) / riskPerUnit).toFixed(2));
-  const rr3 = parseFloat((Math.abs(t3 - entry) / riskPerUnit).toFixed(2));
+  // T2: AI ok if ≥ 2.0R AND different from T1 by at least 0.5R
+  const t1rr = rrOf(t1);
+  const t2MinRR = Math.max(2.0, t1rr + 0.5); // must be at least 0.5R above T1
+  if (!t2 || isNaN(t2) || !dirOk(t2) || rrOf(t2) < t2MinRR || Math.abs(t2 - t1) < riskPerUnit * 0.3) {
+    t2 = engineRisk?.t2 ?? (isBull ? entry + riskPerUnit * 3.0 : entry - riskPerUnit * 3.0);
+    // Ensure T2 from engine also meets minimum
+    if (rrOf(t2) < 2.0) {
+      t2 = isBull ? entry + riskPerUnit * 3.0 : entry - riskPerUnit * 3.0;
+    }
+    console.log(`[resolveRisk] T2 adjusted → ${t2?.toFixed(4)} (AI was ${aiSignal.target2})`);
+  }
 
+  // T3: ≥ 4.0R AND above T2
+  const t3MinRR = Math.max(4.0, rrOf(t2) + 1.0);
+  if (!t3 || isNaN(t3) || !dirOk(t3) || rrOf(t3) < t3MinRR) {
+    t3 = engineRisk?.t3 ?? (isBull ? entry + riskPerUnit * 5.0 : entry - riskPerUnit * 5.0);
+    console.log(`[resolveRisk] T3 adjusted → ${t3?.toFixed(4)} (AI was ${aiSignal.target3})`);
+  }
+
+  // ── Final RR calculations ────────────────────────────
+  const rr1 = parseFloat(rrOf(t1).toFixed(2));
+  const rr2 = parseFloat(rrOf(t2).toFixed(2));
+  const rr3 = parseFloat(rrOf(t3).toFixed(2));
+
+  // ── Position sizing (1% risk) ────────────────────────
   const riskAmount   = parseFloat((accountSize * 1 / 100).toFixed(2));
   const positionSize = parseFloat((riskAmount / riskPerUnit).toFixed(4));
-  const profitT1     = parseFloat((positionSize * 0.5 * Math.abs(t1 - entry)).toFixed(2));
-  const profitT2     = parseFloat((positionSize * 0.3 * Math.abs(t2 - entry)).toFixed(2));
-  const profitT3     = parseFloat((positionSize * 0.2 * Math.abs(t3 - entry)).toFixed(2));
+
+  // ── Profits by target (50/30/20 split) ──────────────
+  const profitT1 = parseFloat((positionSize * 0.5 * Math.abs(t1 - entry)).toFixed(2));
+  const profitT2 = parseFloat((positionSize * 0.3 * Math.abs(t2 - entry)).toFixed(2));
+  const profitT3 = parseFloat((positionSize * 0.2 * Math.abs(t3 - entry)).toFixed(2));
+  const totalPotentialProfit = parseFloat((profitT1 + profitT2 + profitT3).toFixed(2));
+
+  // ── Validity: trade is valid only if T2 ≥ 2.0R ──────
+  const isValidSetup = rr2 >= 2.0;
+  const noTradeReason = !isValidSetup
+    ? `T2 RR is ${rr2} — minimum 2.0R required for valid trade`
+    : null;
+
+  const setupQuality = rr2 >= 3.5 ? "A+" : rr2 >= 2.5 ? "A" : rr2 >= 2.0 ? "B" : "C";
 
   return {
     isBull, bias,
-    entry: parseFloat(entry.toFixed(8)),
-    sl:    parseFloat(sl.toFixed(8)),
-    slSource: slValid ? "AI_VALIDATED" : "ENGINE_ATR",
+    entry:  parseFloat(entry.toFixed(8)),
+    sl:     parseFloat(sl.toFixed(8)),
+    slSource,
     t1: parseFloat(t1.toFixed(8)),
     t2: parseFloat(t2.toFixed(8)),
     t3: parseFloat(t3.toFixed(8)),
     rr1, rr2, rr3,
     riskAmount, positionSize,
     profitT1, profitT2, profitT3,
-    totalPotentialProfit: parseFloat((profitT1 + profitT2 + profitT3).toFixed(2)),
-    atrUsed: parseFloat(atr?.toFixed(6) || 0),
-    isValidSetup: rr2 >= 2.0,
-    setupQuality: rr2 >= 3.0 ? "A+" : rr2 >= 2.5 ? "A" : rr2 >= 2.0 ? "B" : "C",
+    totalPotentialProfit,
+    atrUsed:      parseFloat((atr || 0).toFixed(8)),
+    isValidSetup,
+    noTradeReason,
+    setupQuality,
     tradeManagement: {
-      step1: `Enter ${bias} at ${entry.toFixed(4)}`,
-      step2: `T1 hit (${t1.toFixed(4)}, RR ${rr1}): Close 50%, move SL to ${entry.toFixed(4)} (breakeven)`,
-      step3: `T2 hit (${t2.toFixed(4)}, RR ${rr2}): Close 30%, trail SL by 1 ATR`,
-      step4: `Let 20% run to T3 (${t3.toFixed(4)}, RR ${rr3}) with trailing SL`,
-      invalidation: `Close beyond SL ${sl.toFixed(4)} = exit full position`,
+      step1: `Enter ${bias} at ${entry.toFixed(4)} — size ${positionSize} units`,
+      step2: `T1 hit (${t1.toFixed(4)}, RR 1:${rr1}): Close 50%, move SL to ${entry.toFixed(4)} (breakeven)`,
+      step3: `T2 hit (${t2.toFixed(4)}, RR 1:${rr2}): Close 30%, trail SL by 1 ATR (${atr?.toFixed(4)})`,
+      step4: `Let 20% run to T3 (${t3.toFixed(4)}, RR 1:${rr3}) — trailing SL`,
+      invalidation: `Full exit if price closes beyond SL ${sl.toFixed(4)}`,
     }
   };
 }
@@ -1257,15 +1460,16 @@ function formatSignal(symbol, tf, aiSignal, smcData, finalRisk) {
   const now = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
   const ms  = smcData.marketStructure || {};
   const ema = smcData.emaData || {};
+  const noTrade = !finalRisk.isValidSetup;
 
   let msg = `${vEm} *${verdict} — ${symbol}* ${sEm}
 ━━━━━━━━━━━━━━━━━━━━
-📊 *TF:* ${tf} | *AI:* ${aiSignal.isAiFallback ? "ENGINE_FALLBACK⚠️" : "Gemini"}
+📊 *TF:* ${tf} | *AI:* ${aiSignal.isAiFallback ? "ENGINE_FALLBACK⚠️" : "Gemini✅"}
 ⏰ *IST:* ${now}
 
 ${sEm} *SIGNAL: ${signal}* | ${vEm} *${verdict}*
 ${qEm} *Quality: ${finalRisk.setupQuality}* | Conf: ${aiSignal.confidence}%
-${aiSignal.isAiFallback ? "⚠️ *AI FALLBACK — verify manually*\n" : ""}
+${aiSignal.isAiFallback ? `⚠️ *AI FALLBACK* — ${aiSignal.fallbackReason || "parse failed"}\n` : ""}${noTrade ? `🚫 *NO TRADE* — ${finalRisk.noTradeReason}\n` : ""}
 ━━━━━━━━━━━━━━━━━━━━
 💰 *Price:* ${smcData.currentPrice}
 📍 *ENTRY:* \`${finalRisk.entry}\`
